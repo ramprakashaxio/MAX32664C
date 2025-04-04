@@ -1,0 +1,138 @@
+It means the MAX32664C is still “busy” (returning status 0xFE) whenever you send the “enable AFE” or “enable algorithm” commands. In other words, the hub has not finished processing previous steps and will not accept new commands yet. Below are the common causes and simple ways to fix it.
+
+1) Give the Hub More Time or Check DevBusy Before Proceeding
+Even though you already wait 1.5 seconds after reset, some firmware versions can take a bit longer to become fully ready, or might be busy from previous commands. You can fix this by polling the hub status (family=0x00, index=0x00) in a small loop until DevBusy bit is clear.
+
+How to Poll the Status Until Not Busy
+cpp
+Copy
+Edit
+// Pseudocode function:
+// Repeatedly read the hub status until DevBusy bit is cleared or timeout.
+bool wait_until_not_busy(int max_ms=2000)
+{
+    Timer t;
+    t.start();
+    while (t.elapsed_time() < max_ms * 1ms)
+    {
+        hub_wake();
+        uint8_t cmd[2] = {0x00,0x00};
+        uint8_t resp[1] = {0xFF};
+        int ret = i2c_command_with_retry(cmd, 2, resp, 1);
+        hub_sleep();
+        if (ret == 0) {
+            uint8_t status = resp[0];
+            // Bit6 => DevBusy
+            if ((status & 0x40) == 0) {
+                // Not busy => success
+                return true;
+            }
+        }
+        ThisThread::sleep_for(10ms); // small delay before next check
+    }
+    return false; // timed out
+}
+Then call this helper right before you try “Enable AFE” or “Enable Algorithm,” for example:
+
+cpp
+Copy
+Edit
+// After setting output mode:
+if (! wait_until_not_busy(2000)) {
+  printf("ERROR: Hub stayed busy too long!\n");
+  // handle error...
+}
+
+// Now enable the AFE
+// ...
+This ensures you never send the next command while the hub’s internal processor is still busy. It is the most reliable solution if you get 0xFE busy responses.
+
+2) Confirm Your Hub Actually Has a Valid Application
+If your hub firmware is missing or corrupted, you can get perpetual 0xFE busy. Check:
+
+Does Read Operating Mode (family=0x02, index=0x00) return 0x00 (application mode)? That’s good.
+
+Read the firmware version (family=0xFF, index=0x03). Does it return valid bytes (e.g. status=0x00, then some version numbers)? If it never returns valid, you may need to flash the .msbl firmware via bootloader mode.
+
+If the hub truly has a valid app, reading the FW version should succeed with something like Status=0x00, version=30.13.xx....
+
+3) Insert Larger Delays Between Steps
+Sometimes just adding a bigger delay (200–500 ms) after each step can be enough if your firmware is older or slower. For example:
+
+Set Output FIFO => Sensor Only
+
+ThisThread::sleep_for(250ms)
+
+Enable AFE => ...
+
+ThisThread::sleep_for(300ms)
+
+Enable Algorithm => ...
+
+ThisThread::sleep_for(500ms)
+
+If you keep seeing 0xFE, then do the polling approach from #1 above.
+
+4) Confirm Hardware Connections & Power
+MFIO must be driven high/low by the host, not left floating.
+
+RESET must be connected and pulsed low for at least ~10ms.
+
+The sensor lines (SCL, SDA) must be correct.
+
+Make sure you provide proper supply voltage and that VCORE or VDDIO pins are not undervoltage.
+
+If your hardware wiring is off, the hub can stay busy waiting for the sensor to respond.
+
+5) Full Example Using “Wait-Until-Not-Busy”
+Below is an updated excerpt of your code around the “Enable AFE” step, showing a poll for DevBusy:
+
+cpp
+Copy
+Edit
+// After setting output mode to sensor only:
+printf("[Wait for hub to become idle...]\n");
+if (!wait_until_not_busy(2000)) {
+   printf("!!!Error: hub never left 'busy' state.\n");
+}
+
+// Now enable AFE => 0x44,0x00 => 0x01,0x00
+{
+    printf("\n[Enable AFE => MAX86141]\n");
+    uint8_t cmd[4] = {0x44, 0x00, 0x01, 0x00};
+    uint8_t resp[1] = {0xFF};
+
+    hub_wake();
+    int ret = i2c_command_with_retry(cmd, 4, resp, 1);
+    hub_sleep();
+
+    print_hex("  Write:", cmd, 4);
+    print_hex("  Read :", resp, 1);
+
+    if (ret != 0) {
+        printf("!!!Error: enabling AFE\n");
+    } else if (resp[0] != 0x00) {
+        printf("!!!AFE command returned status=0x%02X => means error\n", resp[0]);
+    } else {
+        printf("  AFE enable status=0x00 => success\n");
+    }
+    ThisThread::sleep_for(250ms); // typical post-AFE delay
+}
+
+// Then wait for idle again before enabling algorithm:
+if (!wait_until_not_busy(2000)) {
+   printf("!!!Error: hub never left 'busy' after enabling AFE.\n");
+}
+
+// Now enable the algo
+// ...
+With these changes, you should stop getting repeated 0xFE (busy) responses, as the firmware will only move on once the hub is truly ready.
+
+Summary
+0xFE means the MAX32664C’s internal CPU is too busy to accept new commands.
+
+Fix by polling the status or adding bigger delays until the DevBusy bit is clear.
+
+Also confirm you have valid firmware and correct wiring.
+
+Once the device is no longer busy, the commands Enable AFE and Enable Algorithm should succeed, and you’ll be able to read raw PPG data without errors.
