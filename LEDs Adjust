@@ -1,0 +1,449 @@
+#include "mbed.h"
+#include <chrono>
+using namespace std::chrono;
+
+/*============================================================================
+ * Pin Assignments (Adjust as needed)
+ *============================================================================*/
+#define HUB_I2C_WRITE_ADDR 0xAA  // 7-bit = 0x55 => write=0xAA, read=0xAB
+#define HUB_I2C_READ_ADDR  0xAB
+
+// Retry-related constants
+static const int MAX_RETRIES    = 5;
+static const int CMD_DELAY_MS   = 5;    // Wait ~5ms after each write before read
+static const int RETRY_DELAY_MS = 20;   // If 0xFE or bus fail, wait 20ms & retry
+static const int LED_SWEEP_DELAY_MS = 1000; // Delay 1s between LED current steps
+
+#ifndef I2C_SDA
+  #define I2C_SDA I2C_SDA0
+#endif
+#ifndef I2C_SCL
+  #define I2C_SCL I2C_SCL0
+#endif
+
+// Adjust these pins for your board
+DigitalOut reset_pin(P0_5);
+DigitalOut mfio_pin(P0_6);
+
+// Mbed I2C object (7-bit addressing by default)
+I2C i2c(I2C_SDA, I2C_SCL);
+
+/** Helper to print a buffer in hex */
+static void print_hex(const char* prefix, const uint8_t* buf, size_t len) {
+    printf("%s [", prefix);
+    for (size_t i = 0; i < len; i++) {
+        printf(" %02X", buf[i]);
+    }
+    printf(" ]\r\n");
+}
+
+/** Wake the hub by pulling MFIO low for ~300 us */
+inline void hub_wake() {
+    mfio_pin = 0;
+    wait_us(300); // ~250–300 us for hub to wake from deep sleep
+}
+
+/** Let the hub go back to sleep by setting MFIO high */
+inline void hub_sleep() {
+    mfio_pin = 1;
+}
+
+/**
+ * i2c_command_with_retry():
+ *   - Write `write_len` bytes from `write_buf` to 0xAA
+ *   - If `read_len>0`, do repeated START and read `read_len` bytes from 0xAB
+ *   - Retry up to MAX_RETRIES if:
+ *       * i2c.write or i2c.read fails
+ *       * read_buf[0] == 0xFE (hub busy)
+ * Returns 0 on success; -1 on failure.
+ */
+static int i2c_command_with_retry(const uint8_t *write_buf, size_t write_len,
+                                  uint8_t *read_buf,  size_t read_len)
+{
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        // Write
+        int wret = i2c.write(HUB_I2C_WRITE_ADDR, (const char*)write_buf, write_len,
+                             (read_len > 0));  // if we intend to read, do repeated START
+        if (wret != 0) {
+            // Write failed, wait & retry
+            printf("  [WARN] i2c.write fail (ret=%d), attempt=%d\n", wret, attempt+1);
+            thread_sleep_for(RETRY_DELAY_MS);
+            continue;
+        }
+
+        thread_sleep_for(CMD_DELAY_MS);
+
+        // If read_len>0, read response
+        if (read_len > 0) {
+            int rret = i2c.read(HUB_I2C_READ_ADDR, (char*)read_buf, read_len);
+            if (rret != 0) {
+                // Read failed, wait & retry
+                printf("  [WARN] i2c.read fail (ret=%d), attempt=%d\n", rret, attempt+1);
+                thread_sleep_for(RETRY_DELAY_MS);
+                continue;
+            }
+            // 0xFE => device busy => retry
+            if (read_buf[0] == 0xFE) {
+                printf("  [WARN] Hub busy (status=0xFE), attempt=%d\n", attempt+1);
+                thread_sleep_for(RETRY_DELAY_MS);
+                continue;
+            }
+        }
+        // Success
+        return 0;
+    }
+    return -1; // All retries failed
+}
+
+/** Optional I2C bus scanner */
+void scan_i2c_bus() {
+    printf("\n[I2C Scan] Scanning bus...\n");
+    for (int addr7 = 1; addr7 < 127; addr7++) {
+        if (i2c.write(addr7 << 1, nullptr, 0) == 0) {
+            printf(" - Found device @ 7-bit 0x%02X\n", addr7);
+        }
+    }
+    printf("[I2C Scan] Done.\n\n");
+}
+
+/** 
+ * Interpret the hub status byte's bits:
+ *   Bit0 => sensor comm error
+ *   Bit3 => Data Ready
+ *   Bit4 => Output FIFO OverFlow
+ *   Bit5 => Input FIFO OverFlow
+ *   Bit6 => Dev Busy
+ */
+static void interpret_hub_status(uint8_t status_byte)
+{
+    printf("  Hub Status Byte = 0x%02X =>", status_byte);
+
+    if (status_byte & 0x01) {
+        printf(" [SensorCommError]");
+    }
+    // bits 1-2 => reserved
+
+    if (status_byte & 0x08) {
+        printf(" [DataReady]");
+    }
+    if (status_byte & 0x10) {
+        printf(" [OutputFifoOverflow]");
+    }
+    if (status_byte & 0x20) {
+        printf(" [InputFifoOverflow]");
+    }
+    if (status_byte & 0x40) {
+        printf(" [DeviceBusy]");
+    }
+    // bit7 => reserved
+
+    printf("\n");
+}
+
+/** Write a single byte to a sensor register, e.g. LED2 current => 0x24. */
+int write_sensor_register(uint8_t sensor_id, uint8_t regaddr, uint8_t value)
+{
+    // Command: Family=0x40 => Write Register
+    //   Byte0 => 0x40
+    //   Byte1 => sensor_id (0x00 => MAX86141)
+    //   Byte2 => regaddr
+    //   Byte3 => value
+    uint8_t cmd[4];
+    cmd[0] = 0x40;
+    cmd[1] = sensor_id;
+    cmd[2] = regaddr;
+    cmd[3] = value;
+
+    uint8_t resp[1] = {0xFF};
+    hub_wake();
+    int ret = i2c_command_with_retry(cmd, 4, resp, 1);
+    hub_sleep();
+
+    print_hex("  Write:", cmd, 4);
+    print_hex("  Read :", resp, 1);
+
+    if (ret != 0) {
+        printf("!!!Error: write_sensor_register i2c fail\n");
+        return -1;
+    }
+    if (resp[0] != 0x00) {
+        printf("!!!Error: write_sensor_register status=0x%02X\n", resp[0]);
+        return -1;
+    }
+    return 0; // success
+}
+
+/** Read a single byte from sensor register, e.g. LED2 current => 0x24 */
+int read_sensor_register(uint8_t sensor_id, uint8_t regaddr, uint8_t *out_val)
+{
+    // Command: Family=0x41 => Read Register
+    //   Byte0 => 0x41
+    //   Byte1 => sensor_id
+    //   Byte2 => regaddr
+    uint8_t cmd[3];
+    cmd[0] = 0x41;
+    cmd[1] = sensor_id;
+    cmd[2] = regaddr;
+
+    // Expect 2 bytes in response:
+    //   resp[0] => status
+    //   resp[1] => registerValue
+    uint8_t resp[2] = {0xFF, 0xFF};
+
+    hub_wake();
+    int ret = i2c_command_with_retry(cmd, 3, resp, 2);
+    hub_sleep();
+
+    print_hex("  Write:", cmd, 3);
+    print_hex("  Read :", resp, 2);
+
+    if (ret != 0) {
+        printf("!!!Error: read_sensor_register i2c fail\n");
+        return -1;
+    }
+    if (resp[0] != 0x00) {
+        printf("!!!Error: read_sensor_register status=0x%02X\n", resp[0]);
+        return -1;
+    }
+    *out_val = resp[1];
+    return 0;
+}
+
+int main()
+{
+    printf("\n=== MAX32664C Demo with AFE, Algo, LED Current Sweep ===\n");
+
+    // 1) Hardware reset => Application mode
+    printf("[1] Hardware reset => Application Mode...\n");
+    mfio_pin = 1;   // MFIO high => application
+    reset_pin = 0;
+    thread_sleep_for(10);
+    reset_pin = 1;
+    thread_sleep_for(50);
+    // give up to 1.5s for full init
+    thread_sleep_for(1500);
+    printf(" - Reset done. Should be in Application mode.\n");
+
+    // (Optional) I2C Scan
+    scan_i2c_bus();
+
+    // Step: read the operating mode => family=0x02, index=0x00
+    {
+        printf("\n[Read Operating Mode: 0x02, 0x00]\n");
+        uint8_t cmd[2]  = {0x02, 0x00};
+        uint8_t resp[2] = {0};
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 2, resp, 2);
+        hub_sleep();
+        print_hex("  Write:", cmd, 2);
+        print_hex("  Read :", resp, 2);
+
+        if (ret != 0) {
+            printf("!!!Error: read mode failed\n");
+        } else {
+            printf("  HubStatus=0x%02X, Mode=0x%02X\n", resp[0], resp[1]);
+        }
+    }
+
+    // Step: read the firmware version => family=0xFF, index=0x03
+    {
+        printf("\n[Read AlgoHub Version: 0xFF, 0x03]\n");
+        uint8_t cmd[2]  = {0xFF, 0x03};
+        // typically returns { status, major, minor, additional... } => up to 4 bytes data
+        uint8_t resp[5] = {0};
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 2, resp, 5);
+        hub_sleep();
+        print_hex("  Write:", cmd, 2);
+        print_hex("  Read :", resp, 5);
+
+        if (ret != 0) {
+            printf("!!!Error: read version failed\n");
+        } else {
+            printf("  Status=0x%02X, FWVersion=0x%02X 0x%02X 0x%02X 0x%02X\n",
+                   resp[0], resp[1], resp[2], resp[3], resp[4]);
+        }
+    }
+
+    // 1.3) Set the output FIFO mode => sensor + algorithm => let's use 0x03
+    {
+        printf("\n[Set Output FIFO => sensor+algo (0x03)]\n");
+        uint8_t cmd[3] = {0x10, 0x00, 0x03}; // family=0x10, idx=0x00 => 0x03 => sensor+algo
+        uint8_t resp[1] = {0};
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 3, resp, 1);
+        hub_sleep();
+        print_hex("  Write:", cmd, 3);
+        print_hex("  Read :", resp, 1);
+
+        if (ret != 0) {
+            printf("!!!Error: set FIFO mode\n");
+        } else {
+            printf("  Status=0x%02X\n", resp[0]);
+        }
+    }
+
+    // Enable AFE => "AA 44 00 01 00"
+    {
+        printf("\n[Enable AFE: 0x44,0x00 => 0x01,0x00]\n");
+        uint8_t cmd[4] = {0x44, 0x00, 0x01, 0x00};
+        uint8_t resp[1] = {0};
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 4, resp, 1);
+        hub_sleep();
+        print_hex("  Write:", cmd, 4);
+        print_hex("  Read :", resp, 1);
+
+        if (ret != 0) {
+            printf("!!!Error: enabling AFE\n");
+        } else {
+            printf("  Status=0x%02X => AFE enabled\n", resp[0]);
+        }
+        thread_sleep_for(250); // recommended CMD_DELAY after enabling AFE
+    }
+
+    // Enable accelerometer => "AA 44 04 01 00"
+    {
+        printf("\n[Enable Accelerometer: 0x44,0x04 => 0x01,0x00]\n");
+        uint8_t cmd[4] = {0x44, 0x04, 0x01, 0x00};
+        uint8_t resp[1] = {0};
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 4, resp, 1);
+        hub_sleep();
+        print_hex("  Write:", cmd, 4);
+        print_hex("  Read :", resp, 1);
+
+        if (ret != 0) {
+            printf("!!!Error: enabling accel\n");
+        } else {
+            printf("  Status=0x%02X => Accel enabled\n", resp[0]);
+        }
+        thread_sleep_for(20);
+    }
+
+    // Enable the WHRM+SpO2 => "AA 52 07 01"
+    {
+        printf("\n[Enable Algorithm: 0x52,0x07 => 0x01]\n");
+        uint8_t cmd[3] = {0x52, 0x07, 0x01};
+        uint8_t resp[1] = {0};
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 3, resp, 1);
+        hub_sleep();
+        print_hex("  Write:", cmd, 3);
+        print_hex("  Read :", resp, 1);
+
+        if (ret != 0) {
+            printf("!!!Error: enabling algo\n");
+        } else {
+            printf("  Status=0x%02X => Algo enabled\n", resp[0]);
+        }
+        // recommended ~320–465ms for algo to init:
+        thread_sleep_for(465);
+    }
+
+    // Read status once to confirm no sensor errors, no busy, etc.
+    {
+        printf("\nCheck hub status after init => (0x00,0x00)\n");
+        uint8_t cmd[2]  = {0x00, 0x00};
+        uint8_t resp[1] = {0xFF};
+
+        hub_wake();
+        int ret = i2c_command_with_retry(cmd, 2, resp, 1);
+        hub_sleep();
+        print_hex("  Write:", cmd, 2);
+        print_hex("  Read :", resp, 1);
+
+        if (ret != 0) {
+            printf("!!!Error: read status after init\n");
+        } else {
+            interpret_hub_status(resp[0]);
+        }
+    }
+
+    printf("\n=== Initialization done. Now sweeping LED2 current from 0x10..0x7F in 0x10 steps ===\n");
+
+    // Main loop: We'll do two tasks:
+    // 1) LED current sweep (once per second).
+    // 2) Read data from FIFO (just a small chunk) to confirm raw samples come in.
+    uint8_t led2_val = 0x10;
+    while (true) {
+        // (A) LED2 increment
+        if (led2_val <= 0x7F) {
+            // Write new LED2 amplitude
+            printf("\n** Setting LED2 amplitude to 0x%02X **\n", led2_val);
+            if (write_sensor_register(/*sensorID=*/0x00, /*reg=*/0x24, led2_val) == 0) {
+                // read back
+                uint8_t checkval = 0xFF;
+                read_sensor_register(0x00, 0x24, &checkval);
+                printf("  => LED2 register readback=0x%02X\n", checkval);
+            }
+            led2_val += 0x10; // next step
+            if (led2_val < 0x10) { // if overflow
+                led2_val = 0x7F;  // clamp
+            }
+        } else {
+            printf("\n(LED2 already at max ~0x7F, continuing...)\n");
+        }
+
+        // (B) Read the hub status
+        {
+            uint8_t cmd[2] = {0x00, 0x00};
+            uint8_t resp[1] = {0xFF};
+            hub_wake();
+            int ret = i2c_command_with_retry(cmd, 2, resp, 1);
+            hub_sleep();
+            if (ret == 0) {
+                printf("[Hub Status read] => 0x%02X\n", resp[0]);
+                interpret_hub_status(resp[0]);
+            } else {
+                printf("!!!Error: reading status in loop.\n");
+            }
+        }
+
+        // (C) Check how many samples in FIFO => 0x12,0x00
+        uint8_t sample_count=0;
+        {
+            uint8_t cmd[2] = {0x12, 0x00};
+            uint8_t resp[2] = {0xFF,0xFF};
+            hub_wake();
+            int ret = i2c_command_with_retry(cmd, 2, resp, 2);
+            hub_sleep();
+            print_hex("  Write:", cmd, 2);
+            print_hex("  Read :", resp, 2);
+
+            if (ret == 0 && resp[0] == 0x00) {
+                sample_count = resp[1];
+                printf("  #Samples in FIFO => %d\n", sample_count);
+            } else {
+                printf("  ???Error reading #samples\n");
+            }
+        }
+
+        // (D) If sample_count>0, read them => 0x12,0x01 
+        if (sample_count > 0) {
+            uint8_t cmd[2] = {0x12, 0x01};
+            // Enough to hold up to ~sample_count*(size_of_sample)
+            // We'll just read 50 bytes for demonstration 
+            // (if you expect more, do a while loop, chunking in 50B increments.)
+            uint8_t resp[50];
+            memset(resp, 0xCC, sizeof(resp));
+
+            hub_wake();
+            int ret = i2c_command_with_retry(cmd, 2, resp, sizeof(resp));
+            hub_sleep();
+
+            print_hex("  Write:", cmd, 2);
+            if (ret == 0) {
+                print_hex("  FIFO data read:", resp, sizeof(resp));
+                // resp[0] => status, rest => data
+                if (resp[0] != 0x00) {
+                    printf("  ???Non-zero status=0x%02X in FIFO read\n", resp[0]);
+                }
+            } else {
+                printf("  ???Error: reading FIFO data\n");
+            }
+        }
+
+        thread_sleep_for(LED_SWEEP_DELAY_MS); // 1s
+    }
+}
